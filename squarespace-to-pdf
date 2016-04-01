@@ -1,0 +1,179 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import hashlib
+import logging
+import optparse
+import requests
+import tempfile
+import subprocess
+
+from lxml import etree
+from lxml.cssselect import CSSSelector
+
+STYLESHEET = """
+#comments,
+footer,
+aside,
+#logo,
+#mobileMenuLink,
+nav,
+#misc {
+  display: none;
+}
+
+body {
+    font-size: 200%;
+    font-family: serif;
+}
+
+a {
+    color: black !important;
+    border-bottom: dashed 1px black !important;
+    text-decoration: none !important;
+}
+
+h1 {
+  font-size: 180%;
+  text-align: left;
+  line-height: 120%;
+}
+
+h1 a,
+h2 a,
+h3 a,
+h4 a,
+h5 a,
+h6 a {
+    border: none !important;
+    text-decoration: none !important;
+}
+
+p {
+    text-align: justify;
+}
+"""
+
+class SquarespaceToPDF(object):
+    def __init__(self):
+        self.session = None
+
+    def main(self):
+        parser = optparse.OptionParser(
+            usage='%prog [options] <url> <filename.pdf>',
+        )
+
+        parser.add_option('--verbosity', dest='verbosity', default=0, type='int',
+            help="Verbosity level; 0=minimal output, 1=normal output, "
+                "2=verbose output, 3=very verbose output")
+        parser.add_option('--cache-dir', dest='cache_dir', default=None,
+            help="Download cache dir")
+        parser.add_option('--wkhtmltopdf', dest='wkhtmltopdf',
+            default='/usr/bin/wkhtmltopdf', help="Location of wkhtmltopdf binary")
+
+        self.options, args = parser.parse_args()
+
+        if len(args) != 2:
+            parser.error("must specify an url and an output filename")
+
+        self.options.base_url = args[0].rstrip('/')
+        self.options.filename = args[1]
+
+        self.setup_logging()
+
+        self.create_pdf()
+
+        return 0
+
+    def create_pdf(self):
+        urls = []
+        suffix = '/blog'
+
+        while True:
+            page = self.parse('%s%s' % (self.options.base_url, suffix))
+
+            for x in CSSSelector('h1.entry-title')(page):
+                urls.append('%s%s' % (
+                    self.options.base_url,
+                    x.find('a').get('href')),
+                )
+
+            # Pagination
+            try:
+                suffix = CSSSelector('a.older-posts')(page)[0].get('href')
+            except IndexError:
+                break
+
+        urls.reverse()
+
+        with tempfile.NamedTemporaryFile() as stylesheet:
+            stylesheet.write(STYLESHEET)
+            stylesheet.flush()
+
+            args = [
+                self.options.wkhtmltopdf,
+                '--user-style-sheet', 'file://%s' % stylesheet.name,
+                '--allow', self.options.base_url,
+                '--disable-javascript',
+                '--no-images',
+            ]
+
+            if self.options.cache_dir is not None:
+                args.extend([
+                    '--cache-dir',
+                    self.options.cache_dir,
+                ])
+
+            args.append('toc')
+            args.extend(urls)
+            args.append(self.options.filename)
+
+            self.log.info("Executing: %s", ' '.join(args))
+            subprocess.check_call(args)
+
+    def parse(self, *args, **kwargs):
+        return etree.HTML(self.GET(*args, **kwargs))
+
+    def GET(self, url):
+        filename = None
+        if self.options.cache_dir is not None:
+            filename = os.path.join(
+                self.options.cache_dir,
+                'cache-%s' % hashlib.sha1(url).hexdigest(),
+            )
+
+        if filename and os.path.exists(filename):
+            self.log.info("Using cached download for %s from %s", filename, url)
+            with open(filename) as f:
+                return f.read().decode('utf8')
+
+        if self.session is None:
+            self.session = requests.Session()
+
+        response = self.session.get(url, headers={'User-agent': 'Mozilla/5.0'})
+        response.raise_for_status()
+
+        if filename is not None:
+            self.log.info("Caching download for %s at %s", filename, url)
+            with open(filename, 'w') as f:
+                f.write(response.text.encode('utf8'))
+
+        return response.text
+
+    def setup_logging(self):
+        self.log = logging.getLogger()
+        self.log.setLevel({
+            0: logging.WARNING,
+            1: logging.INFO,
+            2: logging.DEBUG,
+        }[self.options.verbosity])
+
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(
+            logging.Formatter('%(asctime).19s %(levelname).1s %(message)s')
+        )
+        self.log.addHandler(handler)
+
+if __name__ == '__main__':
+    sys.exit(SquarespaceToPDF().main())
